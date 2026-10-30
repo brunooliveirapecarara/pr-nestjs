@@ -2,24 +2,34 @@ import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { FastifyAdapter } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
 import { DRIZZLE, MYSQL_POOL } from '../src/database/database.constants.js';
+import { orders } from '../src/database/schema.js';
+import { JobPublisher } from '../src/queue/job-publisher.service.js';
 import { QueueService } from '../src/queue/queue.service.js';
 import { AppModule } from '../src/app.module.js';
 
 describe('App (e2e)', () => {
-  const values = vi.fn();
-  const dispatch = vi.fn();
+  const orderValues = vi.fn();
+  const jobValues = vi.fn();
+  const tx = {
+    insert: vi.fn((table: unknown) => ({
+      values: table === orders ? orderValues : jobValues,
+    })),
+  };
+  const transaction = vi.fn(
+    async (callback: (executor: typeof tx) => Promise<unknown>) => callback(tx),
+  );
   let app: NestFastifyApplication;
 
   beforeAll(async () => {
-    values.mockResolvedValue([{ insertId: 7 }]);
-
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(MYSQL_POOL)
       .useValue({ end: vi.fn() })
       .overrideProvider(DRIZZLE)
-      .useValue({ insert: () => ({ values }) })
+      .useValue({ transaction })
       .overrideProvider(QueueService)
-      .useValue({ dispatch, onModuleInit: vi.fn() })
+      .useValue({})
+      .overrideProvider(JobPublisher)
+      .useValue({})
       .compile();
 
     app = moduleRef.createNestApplication<NestFastifyApplication>(
@@ -34,8 +44,9 @@ describe('App (e2e)', () => {
   });
 
   beforeEach(() => {
-    dispatch.mockClear();
-    values.mockClear();
+    vi.clearAllMocks();
+    orderValues.mockResolvedValue([{ insertId: 7 }]);
+    jobValues.mockResolvedValue(undefined);
   });
 
   it('GET /health retorna 200 com status ok', async () => {
@@ -64,12 +75,24 @@ describe('App (e2e)', () => {
       product: 'Teclado',
       amount: 19.99,
     });
-    expect(values).toHaveBeenCalledWith({
+    expect(orderValues).toHaveBeenCalledWith({
       customerEmail: 'a@b.com',
       product: 'Teclado',
       amount: '19.99',
     });
-    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(jobValues).toHaveBeenCalledWith({
+      id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      queue: 'order_processing',
+      name: 'process_order',
+      payload: {
+        orderId: 7,
+        customerEmail: 'a@b.com',
+        product: 'Teclado',
+        amount: 19.99,
+      },
+      createdAt: expect.any(Date),
+    });
   });
 
   it.each([
@@ -89,14 +112,13 @@ describe('App (e2e)', () => {
     });
 
     expect(response.statusCode).toBe(400);
-    expect(values).not.toHaveBeenCalled();
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+    expect(orderValues).not.toHaveBeenCalled();
+    expect(jobValues).not.toHaveBeenCalled();
   });
 
-  it('POST /orders responde 500 quando a fila está indisponível', async () => {
-    dispatch.mockImplementationOnce(() => {
-      throw new Error('Fila indisponível: sem conexão com o RabbitMQ');
-    });
+  it('POST /orders responde 500 quando o job não pode ser gravado', async () => {
+    jobValues.mockRejectedValueOnce(new Error('falha ao gravar o job'));
 
     const response = await app.inject({
       method: 'POST',
@@ -105,5 +127,16 @@ describe('App (e2e)', () => {
     });
 
     expect(response.statusCode).toBe(500);
+  });
+
+  it('POST /orders responde 201 mesmo com a fila indisponível (o publicador envia depois)', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/orders',
+      payload: { customer_email: 'a@b.com', product: 'Teclado', amount: 1 },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(jobValues).toHaveBeenCalledTimes(1);
   });
 });

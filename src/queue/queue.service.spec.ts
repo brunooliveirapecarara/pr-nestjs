@@ -4,6 +4,8 @@ import { DiscoveryService, Reflector } from '@nestjs/core';
 import { Test, type TestingModule } from '@nestjs/testing';
 import type { ConsumeMessage } from 'amqplib';
 import { Job, type JobHandler } from './job.decorator.js';
+import { JobPublisher } from './job-publisher.service.js';
+import { JobStore } from './job-store.service.js';
 import { QueueModule } from './queue.module.js';
 import { QueueService } from './queue.service.js';
 
@@ -22,7 +24,11 @@ const amqp = vi.hoisted(() => {
   };
   return {
     channel,
-    connection: { createChannel: vi.fn(), close: vi.fn() },
+    connection: {
+      createChannel: vi.fn(),
+      createConfirmChannel: vi.fn(),
+      close: vi.fn(),
+    },
     connect: vi.fn(),
   };
 });
@@ -54,6 +60,18 @@ class FakeRecovering extends EventEmitter {
 }
 
 vi.mock('amqplib', () => ({ connect: amqp.connect }));
+
+vi.mock('./queue.config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./queue.config.js')>()),
+  REQUEUE_DELAY_MS: 0,
+}));
+
+const store = {
+  claim: vi.fn(),
+  complete: vi.fn(),
+  release: vi.fn(),
+  fail: vi.fn(),
+};
 
 const silentLogger: LoggerService = {
   log: vi.fn(),
@@ -94,16 +112,18 @@ class TestModule {}
  * @param type - Nome do job em `properties.type`.
  * @param body - Corpo bruto da mensagem.
  * @param headers - Headers da mensagem.
+ * @param messageId - Id do job na tabela `jobs`, quando a mensagem veio do outbox.
  * @returns Mensagem no formato `ConsumeMessage`.
  */
 function message(
   type: string,
   body: string,
   headers: Record<string, unknown> = {},
+  messageId?: string,
 ): ConsumeMessage {
   return {
     content: Buffer.from(body),
-    properties: { type, contentType: 'application/json', headers },
+    properties: { type, contentType: 'application/json', headers, messageId },
   } as unknown as ConsumeMessage;
 }
 
@@ -143,7 +163,10 @@ describe('QueueService', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    amqp.channel.ack.mockReset();
+    amqp.channel.nack.mockReset();
     amqp.connection.createChannel.mockResolvedValue(amqp.channel);
+    amqp.connection.createConfirmChannel.mockResolvedValue(amqp.channel);
     amqp.connection.close.mockResolvedValue(undefined);
     amqp.channel.close.mockResolvedValue(undefined);
     amqp.connect.mockImplementation(
@@ -152,7 +175,16 @@ describe('QueueService', () => {
         return recovering;
       },
     );
-    amqp.channel.sendToQueue.mockReturnValue(true);
+    amqp.channel.sendToQueue.mockImplementation((...args: unknown[]) => {
+      const callback = args.find((arg) => typeof arg === 'function') as
+        ((error: unknown) => void) | undefined;
+      callback?.(null);
+      return true;
+    });
+    store.claim.mockResolvedValue('claimed');
+    store.complete.mockResolvedValue(undefined);
+    store.release.mockResolvedValue(undefined);
+    store.fail.mockResolvedValue(undefined);
     amqp.channel.consume.mockImplementation(
       async (_queue: string, callback: Consumer) => {
         deliver = callback;
@@ -161,6 +193,10 @@ describe('QueueService', () => {
     handle.mockResolvedValue(undefined);
 
     moduleRef = await Test.createTestingModule({ imports: [TestModule] })
+      .overrideProvider(JobStore)
+      .useValue(store)
+      .overrideProvider(JobPublisher)
+      .useValue({})
       .setLogger(silentLogger)
       .compile();
     await moduleRef.init();
@@ -216,6 +252,7 @@ describe('QueueService', () => {
       const isolated = new QueueService(
         moduleRef.get(DiscoveryService),
         moduleRef.get(Reflector),
+        store as unknown as JobStore,
       );
 
       expect(() => isolated.dispatch(FlakyJob, { id: 1 })).toThrow(
@@ -422,6 +459,179 @@ describe('QueueService', () => {
       await new Promise((resolve) => setImmediate(resolve));
 
       expect(handle).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('publish (confirmado)', () => {
+    it('publica com o messageId e resolve quando o broker confirma', async () => {
+      await service.publish('q', 'flaky', { id: 1 }, 'job-1');
+
+      expect(amqp.channel.sendToQueue).toHaveBeenCalledWith(
+        'q',
+        Buffer.from('{"id":1}'),
+        {
+          persistent: true,
+          contentType: 'application/json',
+          type: 'flaky',
+          messageId: 'job-1',
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('rejeita quando o broker não confirma a mensagem', async () => {
+      amqp.channel.sendToQueue.mockImplementation((...args: unknown[]) => {
+        (args.at(-1) as (error: unknown) => void)(new Error('nack do broker'));
+        return true;
+      });
+
+      await expect(service.publish('q', 'flaky', {}, 'job-1')).rejects.toThrow(
+        'nack do broker',
+      );
+    });
+
+    it('rejeita job não registrado e fila indisponível', async () => {
+      await expect(service.publish('q', 'inexistente', {})).rejects.toThrow(
+        /não registrado/,
+      );
+
+      recovering.emit('disconnect', new Error('CONNECTION-FORCED'));
+      await expect(service.publish('q', 'flaky', {})).rejects.toThrow(
+        'Fila indisponível',
+      );
+    });
+  });
+
+  describe('registro do job (tabela jobs)', () => {
+    const jobId = 'job-1';
+
+    it('reivindica antes do handle e marca concluído depois', async () => {
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(store.claim).toHaveBeenCalledWith(jobId);
+      expect(handle).toHaveBeenCalledWith({ id: 1 });
+      expect(store.complete).toHaveBeenCalledWith(jobId);
+      expect(amqp.channel.ack).toHaveBeenCalledWith(raw);
+      expect(store.claim.mock.invocationCallOrder[0]!).toBeLessThan(
+        handle.mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it.each(['finished', 'missing'])(
+      'ignora a duplicata (%s): confirma sem executar nem tocar no registro',
+      async (claim) => {
+        store.claim.mockResolvedValue(claim);
+        const raw = message('flaky', '{"id":1}', {}, jobId);
+
+        await consume(raw);
+
+        expect(handle).not.toHaveBeenCalled();
+        expect(store.complete).not.toHaveBeenCalled();
+        expect(amqp.channel.ack).toHaveBeenCalledWith(raw);
+        expect(amqp.channel.nack).not.toHaveBeenCalled();
+      },
+    );
+
+    it('devolve à fila (sem ack) um job que outro worker está executando', async () => {
+      store.claim.mockResolvedValue('busy');
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(handle).not.toHaveBeenCalled();
+      expect(amqp.channel.ack).not.toHaveBeenCalled();
+      expect(amqp.channel.nack).toHaveBeenCalledWith(raw, false, true);
+    });
+
+    it('devolve à fila, sem retry nem DLQ, quando a tabela jobs está indisponível', async () => {
+      store.claim.mockRejectedValue(new Error('db fora do ar'));
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(handle).not.toHaveBeenCalled();
+      expect(amqp.channel.nack).toHaveBeenCalledWith(raw, false, true);
+      expect(amqp.channel.sendToQueue).not.toHaveBeenCalled();
+    });
+
+    it('registra a falha antes de reenviar ao retry e preserva o messageId', async () => {
+      handle.mockRejectedValue(new Error('boom'));
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(store.release).toHaveBeenCalledWith(jobId, expect.any(Error));
+      expect(store.release.mock.invocationCallOrder[0]!).toBeLessThan(
+        amqp.channel.sendToQueue.mock.invocationCallOrder[0]!,
+      );
+      const [[, , options]] = sentTo('q.retry.100ms');
+      expect(options).toMatchObject({ messageId: jobId });
+      expect(store.fail).not.toHaveBeenCalled();
+    });
+
+    it('marca failed ao enviar à DLQ, preservando o messageId', async () => {
+      handle.mockRejectedValue(new Error('boom'));
+
+      await consume(message('flaky', '{"id":1}', { 'x-attempt': 2 }, jobId));
+
+      const [[, , options]] = sentTo('q.dlq');
+      expect(options).toMatchObject({ messageId: jobId });
+      await vi.waitFor(() =>
+        expect(store.fail).toHaveBeenCalledWith(jobId, expect.any(Error)),
+      );
+      expect(store.release).not.toHaveBeenCalled();
+    });
+
+    it('marca failed também para job desconhecido e payload inválido', async () => {
+      await consume(message('inexistente', '{}', {}, jobId));
+      await vi.waitFor(() => expect(store.fail).toHaveBeenCalledTimes(1));
+
+      amqp.channel.ack.mockClear();
+      await consume(message('flaky', '{isso nao e json', {}, 'job-2'));
+      await vi.waitFor(() => expect(store.fail).toHaveBeenCalledTimes(2));
+      expect(store.claim).not.toHaveBeenCalled();
+    });
+
+    it('não perde a mensagem na DLQ se o registro não puder ser atualizado', async () => {
+      handle.mockRejectedValue(new Error('boom'));
+      store.fail.mockRejectedValue(new Error('db fora do ar'));
+      const raw = message('flaky', '{"id":1}', { 'x-attempt': 2 }, jobId);
+
+      await consume(raw);
+
+      expect(sentTo('q.dlq')).toHaveLength(1);
+      expect(amqp.channel.ack).toHaveBeenCalledWith(raw);
+    });
+
+    it('devolve à fila, sem reenviar, se não conseguir registrar a falha', async () => {
+      handle.mockRejectedValue(new Error('boom'));
+      store.release.mockRejectedValue(new Error('db fora do ar'));
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(sentTo('q.retry.100ms')).toHaveLength(0);
+      expect(amqp.channel.nack).toHaveBeenCalledWith(raw, false, true);
+    });
+
+    it('confirma a mensagem mesmo se não conseguir marcar o job como concluído', async () => {
+      store.complete.mockRejectedValue(new Error('db fora do ar'));
+      const raw = message('flaky', '{"id":1}', {}, jobId);
+
+      await consume(raw);
+
+      expect(handle).toHaveBeenCalledTimes(1);
+      expect(amqp.channel.ack).toHaveBeenCalledWith(raw);
+    });
+
+    it('não toca no registro quando a mensagem não tem messageId', async () => {
+      await consume(message('flaky', '{"id":1}'));
+
+      expect(handle).toHaveBeenCalledTimes(1);
+      expect(store.claim).not.toHaveBeenCalled();
+      expect(store.complete).not.toHaveBeenCalled();
     });
   });
 });
