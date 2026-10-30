@@ -10,6 +10,7 @@ import {
   connect,
   type Channel,
   type ChannelModel,
+  type ConfirmChannel,
   type ConsumeMessage,
   type RecoveringChannelModel,
 } from 'amqplib';
@@ -21,10 +22,12 @@ import {
   type JobHandler,
   type JobOptions,
 } from './job.decorator.js';
+import { JobStore } from './job-store.service.js';
 import {
   DEFAULT_QUEUE_CONCURRENCY,
   QUEUE_CONCURRENCY,
   RABBITMQ_INITIAL_CONNECT_RETRIES,
+  REQUEUE_DELAY_MS,
 } from './queue.config.js';
 
 /**
@@ -46,6 +49,8 @@ type JobRegistry = Map<string, Map<string, RegisteredJob>>;
  */
 type Outcome =
   | { status: 'done' }
+  | { status: 'skipped'; reason: string }
+  | { status: 'requeue'; reason: string }
   | { status: 'dead'; error: unknown }
   | { status: 'failed'; job: RegisteredJob; error: unknown };
 
@@ -59,12 +64,13 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
   private readonly registry: JobRegistry = new Map();
   private consumerChannels: Channel[] = [];
   private connection: RecoveringChannelModel | null = null;
-  private publisherChannel: Channel | null = null;
+  private publisherChannel: ConfirmChannel | null = null;
   private shuttingDown = false;
 
   constructor(
     private readonly discovery: DiscoveryService,
     private readonly reflector: Reflector,
+    private readonly store: JobStore,
   ) {}
 
   /**
@@ -107,37 +113,93 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
   }
 
   /**
-   * Publica um job em sua fila de forma persistente.
+   * Publica um job em sua fila de forma persistente, sem registro na tabela `jobs` (não há idempotência
+   * nem rastreio). Para jobs duráveis, grave-os com `JobStore.enqueue` na transação do dado de negócio.
    *
    * @param job - Classe do job, decorada com `@Job()` e registrada em `providers`.
    * @param payload - Dados entregues ao `handle` do job.
    * @returns `true` se a mensagem foi aceita pelo buffer do canal.
-   * @throws Error se a fila não foi inicializada ou se o job não está registrado.
+   * @throws Error se a fila está indisponível ou se o job não está registrado.
    */
   dispatch<TPayload>(
     job: Type<JobHandler<TPayload>>,
     payload: TPayload,
   ): boolean {
-    if (!this.publisherChannel) {
-      throw new Error('Fila indisponível: sem conexão com o RabbitMQ');
-    }
-
+    const channel = this.requirePublisher();
     const options = this.reflector.get<JobOptions | undefined>(Job.KEY, job);
-    if (!options || !this.registry.get(options.queue)?.has(options.name)) {
-      throw new Error(
-        `Job "${options?.name ?? job.name}" não registrado na fila ${options?.queue}`,
-      );
-    }
+    this.assertRegistered(options?.queue, options?.name ?? job.name);
 
-    return this.publisherChannel.sendToQueue(
-      options.queue,
+    return channel.sendToQueue(
+      options!.queue,
       Buffer.from(JSON.stringify(payload)),
       {
         persistent: true,
         contentType: 'application/json',
-        type: options.name,
+        type: options!.name,
       },
     );
+  }
+
+  /**
+   * Publica uma mensagem e espera a confirmação do broker (publisher confirm). Usado pelo publicador da
+   * tabela `jobs`, que só marca o job como publicado depois da confirmação.
+   *
+   * @param queue - Fila de destino.
+   * @param name - Nome do job, enviado em `properties.type`.
+   * @param payload - Dados entregues ao `handle` do job.
+   * @param messageId - Id do job na tabela `jobs`, enviado em `properties.messageId`.
+   * @returns Promise resolvida quando o broker confirmar a mensagem.
+   * @throws Error se a fila está indisponível, o job não está registrado ou o broker rejeitar a mensagem.
+   */
+  async publish(
+    queue: string,
+    name: string,
+    payload: unknown,
+    messageId?: string,
+  ): Promise<void> {
+    const channel = this.requirePublisher();
+    this.assertRegistered(queue, name);
+
+    await new Promise<void>((resolve, reject) => {
+      channel.sendToQueue(
+        queue,
+        Buffer.from(JSON.stringify(payload)),
+        {
+          persistent: true,
+          contentType: 'application/json',
+          type: name,
+          messageId,
+        },
+        (error) => (error ? reject(error as Error) : resolve()),
+      );
+    });
+  }
+
+  /**
+   * Devolve o canal publicador ou falha se não houver conexão.
+   *
+   * @returns Canal publicador com confirmação.
+   * @throws Error se a conexão com o RabbitMQ está indisponível.
+   */
+  private requirePublisher(): ConfirmChannel {
+    if (!this.publisherChannel) {
+      throw new Error('Fila indisponível: sem conexão com o RabbitMQ');
+    }
+    return this.publisherChannel;
+  }
+
+  /**
+   * Garante que o job está registrado na fila.
+   *
+   * @param queue - Fila do job.
+   * @param name - Nome do job.
+   * @returns Nada.
+   * @throws Error se o job não estiver registrado na fila.
+   */
+  private assertRegistered(queue: string | undefined, name: string): void {
+    if (!queue || !this.registry.get(queue)?.has(name)) {
+      throw new Error(`Job "${name}" não registrado na fila ${queue}`);
+    }
   }
 
   /**
@@ -239,7 +301,11 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
    * @throws Erro do amqplib se alguma declaração ou consumo falhar; o amqplib tenta de novo.
    */
   private async setupConnection(model: ChannelModel): Promise<void> {
-    const publisher = await this.openChannel(model, 'publicador');
+    const publisher = (await this.openChannel(
+      model,
+      'publicador',
+      true,
+    )) as ConfirmChannel;
     await this.assertTopology(publisher);
     this.logger.log(
       `🐇 Conectado ao RabbitMQ (filas: ${[...this.registry.keys()].join(', ')})`,
@@ -269,14 +335,18 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
    *
    * @param model - Conexão onde o canal é aberto.
    * @param label - Nome do canal, usado nos logs.
+   * @param confirm - Se `true`, abre um canal com confirmação de publicação.
    * @returns Canal pronto para uso.
    * @throws Erro do amqplib se o canal não puder ser aberto.
    */
   private async openChannel(
     model: ChannelModel,
     label: string,
+    confirm = false,
   ): Promise<Channel> {
-    const channel = await model.createChannel();
+    const channel = confirm
+      ? await model.createConfirmChannel()
+      : await model.createChannel();
     channel.on('error', (error: Error) => {
       this.logger.warn(`⚠️ Canal ${label} com erro: ${error.message}`);
     });
@@ -308,6 +378,12 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
     try {
       if (outcome.status === 'done') {
         channel.ack(raw);
+      } else if (outcome.status === 'skipped') {
+        this.logger.warn(`⏭️ ${label} ${outcome.reason}; ignorando`);
+        channel.ack(raw);
+      } else if (outcome.status === 'requeue') {
+        this.logger.warn(`⏳ ${label} ${outcome.reason}; devolvendo à fila`);
+        await this.requeueLater(channel, raw);
       } else if (outcome.status === 'dead') {
         await this.deadLetter(channel, queue, raw, outcome.error);
       } else {
@@ -324,13 +400,29 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
         `❌ ${label} Falha ao resolver a mensagem; devolvendo à fila`,
         error instanceof Error ? error.stack : String(error),
       );
-      try {
-        channel.nack(raw, false, true);
-      } catch {
-        this.logger.warn(
-          `🔌 ${label} Canal indisponível; o broker reentregará a mensagem`,
-        );
-      }
+      await this.requeueLater(channel, raw);
+    }
+  }
+
+  /**
+   * Devolve a mensagem à fila (`nack` com requeue) depois de uma pausa, para não girar em laço apertado
+   * enquanto o motivo persiste. Se o canal já caiu, o broker reentrega a mensagem sozinho.
+   *
+   * @param channel - Canal do consumidor.
+   * @param raw - Mensagem a devolver.
+   * @returns Promise resolvida depois da pausa e da tentativa de `nack`.
+   */
+  private async requeueLater(
+    channel: Channel,
+    raw: ConsumeMessage,
+  ): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, REQUEUE_DELAY_MS));
+    try {
+      channel.nack(raw, false, true);
+    } catch {
+      this.logger.warn(
+        `🔌 [${raw.properties.type as string}] Canal indisponível; o broker reentregará a mensagem`,
+      );
     }
   }
 
@@ -364,11 +456,53 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
       return { status: 'dead', error };
     }
 
+    const jobId = raw.properties.messageId as string | undefined;
+    if (jobId) {
+      const early = await this.claimJob(jobId);
+      if (early) return early;
+    }
+
     try {
       await job.handler.handle(payload);
-      return { status: 'done' };
     } catch (error) {
       return { status: 'failed', job, error };
+    }
+
+    if (jobId) {
+      await this.store.complete(jobId).catch((error: unknown) => {
+        this.logger.warn(
+          `⚠️ [${queue}/${jobName}] Job concluído, mas o registro não foi atualizado: ${this.describe(error)}`,
+        );
+      });
+    }
+    return { status: 'done' };
+  }
+
+  /**
+   * Reivindica o job na tabela `jobs`. Devolve um resultado só quando a execução não deve prosseguir.
+   *
+   * @param jobId - Id do job (`messageId` da mensagem).
+   * @returns `null` se este worker é o dono da execução; senão o resultado que encerra a mensagem.
+   */
+  private async claimJob(jobId: string): Promise<Outcome | null> {
+    try {
+      const claim = await this.store.claim(jobId);
+      if (claim === 'claimed') return null;
+      if (claim === 'busy') {
+        return { status: 'requeue', reason: `Job ${jobId} em execução` };
+      }
+      return {
+        status: 'skipped',
+        reason:
+          claim === 'missing'
+            ? `Job ${jobId} sem registro`
+            : `Job ${jobId} já finalizado`,
+      };
+    } catch (error) {
+      return {
+        status: 'requeue',
+        reason: `Tabela jobs indisponível (${this.describe(error)})`,
+      };
     }
   }
 
@@ -405,6 +539,8 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
     this.logger.warn(
       `🔁 ${label} Falhou (${this.describe(error)}); tentativa ${attempt + 1}/${job.retries} em ${job.backoffMs}ms`,
     );
+    const jobId = raw.properties.messageId as string | undefined;
+    if (jobId) await this.store.release(jobId, error);
     this.republish(this.retryQueueName(queue, job.backoffMs), raw, {
       'x-attempt': attempt + 1,
     });
@@ -437,6 +573,15 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
     this.logger.error(
       `💀 [${queue}/${raw.properties.type as string}] Enviado para ${dlq}: ${this.describe(error)}`,
     );
+
+    const jobId = raw.properties.messageId as string | undefined;
+    if (jobId) {
+      await this.store.fail(jobId, error).catch((failure: unknown) => {
+        this.logger.warn(
+          `⚠️ Job ${jobId} foi para a DLQ, mas o registro não foi atualizado: ${this.describe(failure)}`,
+        );
+      });
+    }
   }
 
   /**
@@ -460,6 +605,7 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
       persistent: true,
       contentType: raw.properties.contentType as string | undefined,
       type: raw.properties.type as string | undefined,
+      messageId: raw.properties.messageId as string | undefined,
       headers: { ...raw.properties.headers, ...headers },
     });
   }
