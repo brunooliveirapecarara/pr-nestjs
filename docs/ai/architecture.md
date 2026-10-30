@@ -14,7 +14,9 @@ poc-nestjs/
 └── src/
     ├── main.ts                      # único ponto de entrada
     ├── app.module.ts                # módulo raiz + providers globais (pipe/interceptor)
-    ├── health.controller.ts         # GET /health
+    ├── health/
+    │   ├── health.module.ts
+    │   └── health.controller.ts     # GET /health
     ├── config/
     │   └── env.ts
     ├── database/

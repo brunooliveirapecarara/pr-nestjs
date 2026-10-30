@@ -5,6 +5,7 @@ import {
   type OnModuleInit,
   type Type,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { DiscoveryService, Reflector } from '@nestjs/core';
 import {
   connect,
@@ -14,7 +15,7 @@ import {
   type ConsumeMessage,
   type RecoveringChannelModel,
 } from 'amqplib';
-import { env } from '../config/env.js';
+import type { Env } from '../config/env.js';
 import {
   DEFAULT_JOB_BACKOFF_MS,
   DEFAULT_JOB_RETRIES,
@@ -71,6 +72,7 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
     private readonly discovery: DiscoveryService,
     private readonly reflector: Reflector,
     private readonly store: JobStore,
+    private readonly config: ConfigService<Env, true>,
   ) {}
 
   /**
@@ -84,14 +86,17 @@ export class QueueService implements OnModuleInit, OnApplicationShutdown {
   async onModuleInit(): Promise<void> {
     this.discoverJobs();
 
-    this.connection = await connect(env.RABBITMQ_URL, {
-      recovery: {
-        initialMaxRetries: RABBITMQ_INITIAL_CONNECT_RETRIES,
-        maxRetries: Infinity,
-        waitForConnect: false,
-        setup: (model: ChannelModel) => this.setupConnection(model),
+    this.connection = await connect(
+      this.config.get('RABBITMQ_URL', { infer: true }),
+      {
+        recovery: {
+          initialMaxRetries: RABBITMQ_INITIAL_CONNECT_RETRIES,
+          maxRetries: Infinity,
+          waitForConnect: false,
+          setup: (model: ChannelModel) => this.setupConnection(model),
+        },
       },
-    });
+    );
     this.watchConnection(this.connection);
     await this.connection.waitForConnect();
   }

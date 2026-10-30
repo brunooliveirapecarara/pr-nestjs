@@ -160,6 +160,8 @@ Use as exceções do Nest (`NotFoundException`, `BadRequestException`) no servic
 
 ## Health
 
+O healthcheck fica em `src/health/`, com `HealthModule` importado pelo `AppModule`.
+
 ```ts
 @Controller('health')
 export class HealthController {
@@ -181,6 +183,6 @@ export class HealthController {
 
 ## Proibido
 
-- `class-validator`, `class-transformer`, `@nestjs/config`, `@nestjs/microservices`, `@nestjs/typeorm`.
+- `class-validator`, `class-transformer`, validação de env no `@nestjs/config` (`validate`/`validationSchema`), `@nestjs/microservices`, `@nestjs/typeorm`.
 - Injeção por propriedade, `new` manual de providers, `console.log`, `any`.
 - Regra de negócio ou acesso a banco dentro de controllers.

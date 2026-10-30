@@ -48,8 +48,13 @@ import { APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
 import { ZodSerializerInterceptor, ZodValidationPipe } from 'nestjs-zod';
 
 @Module({
-  imports: [DatabaseModule, QueueModule, OrdersModule],
-  controllers: [HealthController],
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true, load: [() => env] }),
+    DatabaseModule,
+    QueueModule,
+    HealthModule,
+    OrdersModule,
+  ],
   providers: [
     { provide: APP_PIPE, useClass: ZodValidationPipe },
     { provide: APP_INTERCEPTOR, useClass: ZodSerializerInterceptor },
@@ -64,5 +69,5 @@ export class AppModule {}
 - Saída: `@ZodSerializerDto(OrderResponseDto)` no handler -> `ZodSerializerInterceptor` valida e remove campos extras.
 - Tipos: use o próprio DTO como tipo (`CreateOrderDto`), ou `z.infer<typeof schema>` quando precisar do tipo puro.
 - Mensagens e nomes de campos do payload permanecem em `snake_case` (`customer_email`); o código interno usa `camelCase`.
-- Variáveis de ambiente **não** são validadas (ver `src/config/env.ts`).
+- Variáveis de ambiente **não** são validadas (ver `src/config/env.ts`; o `ConfigModule` só repassa o objeto `env`, sem `validate`).
 - Proibido `class-validator`/`class-transformer`/`ValidationPipe` nativo.

@@ -1,11 +1,12 @@
 import { Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import {
   FastifyAdapter,
   type NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import { AppModule } from './app.module.js';
-import { env } from './config/env.js';
+import type { Env } from './config/env.js';
 
 /**
  * Inicializa a aplicação Nest e começa a escutar requisições HTTP.
@@ -19,8 +20,11 @@ async function bootstrap(): Promise<void> {
     new FastifyAdapter(),
   );
   app.enableShutdownHooks();
-  await app.listen(env.PORT, '0.0.0.0');
-  new Logger('Bootstrap').log(`🚀 Servidor escutando na porta ${env.PORT}`);
+  const port = app.get<ConfigService<Env, true>>(ConfigService).get('PORT', {
+    infer: true,
+  });
+  await app.listen(port, '0.0.0.0');
+  new Logger('Bootstrap').log(`🚀 Servidor escutando na porta ${port}`);
 }
 
 await bootstrap();

@@ -4,9 +4,10 @@ import {
   Module,
   type OnApplicationShutdown,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { drizzle, type MySql2Database } from 'drizzle-orm/mysql2';
 import { createPool, type Pool } from 'mysql2/promise';
-import { env } from '../config/env.js';
+import type { Env } from '../config/env.js';
 import { DRIZZLE, MYSQL_POOL } from './database.constants.js';
 import * as schema from './schema.js';
 
@@ -18,13 +19,14 @@ import * as schema from './schema.js';
   providers: [
     {
       provide: MYSQL_POOL,
-      useFactory: (): Pool =>
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>): Pool =>
         createPool({
-          host: env.DB_HOST,
-          port: env.DB_PORT,
-          user: env.DB_USER,
-          password: env.DB_PASSWORD,
-          database: env.DB_NAME,
+          host: config.get('DB_HOST', { infer: true }),
+          port: config.get('DB_PORT', { infer: true }),
+          user: config.get('DB_USER', { infer: true }),
+          password: config.get('DB_PASSWORD', { infer: true }),
+          database: config.get('DB_NAME', { infer: true }),
           connectionLimit: 10,
         }),
     },
