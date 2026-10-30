@@ -1,5 +1,6 @@
 /**
- * Configuração da aplicação lida direto do `process.env`, com valor padrão para cada variável.
+ * Configuração da aplicação lida do `process.env`, com valor padrão para cada variável e sem validação.
+ * Carregada pelo `ConfigModule` (`load`) e usada direto pelos scripts standalone de migration.
  */
 export const env = {
   PORT: Number(process.env.PORT ?? 3000),
@@ -10,3 +11,8 @@ export const env = {
   DB_NAME: process.env.DB_NAME ?? 'orders_db',
   RABBITMQ_URL: process.env.RABBITMQ_URL ?? 'amqp://localhost:5672',
 };
+
+/**
+ * Tipo da configuração exposta pelo `ConfigService`.
+ */
+export type Env = typeof env;

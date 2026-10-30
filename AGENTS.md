@@ -29,11 +29,11 @@ Um monólito modular em Node.js + NestJS (adaptador Fastify) que recebe pedidos 
 - **ORM:** Drizzle ORM (Dialeto MySQL/MariaDB) com `mysql2`.
 - **Mensageria:** RabbitMQ via `amqplib` (sem `@nestjs/microservices`; o wrapper é próprio, em `src/queue/`).
 - **Validação:** Zod 4 integrado ao Nest por `nestjs-zod` (Obrigatório para validar a entrada e a saída das rotas; variáveis de ambiente não são validadas). Proibido `class-validator` e `class-transformer`.
-- **Config:** `src/config/env.ts` lido direto do `process.env`. Proibido `@nestjs/config` com validação.
+- **Config:** `src/config/env.ts` lido direto do `process.env` e exposto pelo `ConfigModule` (`@nestjs/config`, `isGlobal`, `ignoreEnvFile`, `load: [() => env]`); os providers leem via `ConfigService<Env, true>`. Proibido validar as variáveis (sem `validate`/`validationSchema`).
 
 ## 📂 Arquitetura de Pastas Obrigatória
 Você deve separar as responsabilidades rigorosamente nos seguintes arquivos:
-- `src/config/env.ts` -> Leitura do `process.env` com valor padrão para cada variável, sem validação.
+- `src/config/env.ts` -> Leitura do `process.env` com valor padrão para cada variável, sem validação. Exporta `env` (carregado pelo `ConfigModule` e usado direto pelos scripts de migration) e o tipo `Env`.
 - `src/database/database.module.ts` -> Módulo `@Global()` que expõe o provider `DRIZZLE` (token em `database.constants.ts`) com o pool `mysql2` e a instância do Drizzle; fecha o pool em `OnApplicationShutdown`.
 - `src/database/schema.ts` -> Definição das tabelas do banco de dados: `orders` e `jobs` (outbox e ciclo de vida dos jobs).
 - `src/database/migrate-up.ts`, `migrate-down.ts`, `migrate-fresh.ts` -> Scripts utilitários de migração (standalone, sem subir o Nest). O `migrate-down.ts` aceita `--step=N` (padrão 1) para reverter as últimas N migrations.
@@ -47,9 +47,10 @@ Você deve separar as responsabilidades rigorosamente nos seguintes arquivos:
 - `src/queue/queue.config.ts` -> Constantes de ajuste: concorrência por fila, lease do job, intervalos do publicador, retenção e tentativas iniciais de conexão.
 - `src/queue/job.decorator.ts` -> Decorator `@Job({ queue, name, retries?, backoffMs? })` (criado com `DiscoveryService.createDecorator`) e a interface `JobHandler<TPayload>`.
 - `src/jobs/` -> Um arquivo `*.job.ts` por job: classe `@Injectable()` decorada com `@Job({ queue, name })` que implementa `handle(payload)`. Registrada em `providers` de um módulo, é descoberta automaticamente. Para enfileirar, chame `jobStore.enqueue(tx, JobClass, payload)` **dentro da transação** do dado de negócio; o `JobPublisher` o publica depois. A mensagem carrega o nome do job em `properties.type` e o id do job em `properties.messageId`.
+- `src/health/` -> `health.module.ts` e `health.controller.ts` (`GET /health`).
 - `src/orders/` -> Módulo de domínio `orders`: `orders.module.ts`, `orders.controller.ts`, `orders.service.ts` (grava pedido e job numa transação) e `order.schema.ts`.
 - `src/<recurso>/<recurso>.schema.ts` -> Schemas Zod, um arquivo por recurso (ex.: `order.schema.ts` com `createOrderSchema`, `orderResponseSchema`, e os DTOs `CreateOrderDto` e `OrderResponseDto` via `createZodDto`), usados nos decorators das rotas. Params e query também ganham schema Zod/DTO quando houver.
-- `src/app.module.ts` -> Módulo raiz: importa `DatabaseModule`, `QueueModule`, `OrdersModule` e registra `APP_PIPE` (`ZodValidationPipe`) e `APP_INTERCEPTOR` (`ZodSerializerInterceptor`). Contém também o `HealthController` (`GET /health`).
+- `src/app.module.ts` -> Módulo raiz: importa `ConfigModule.forRoot(...)`, `DatabaseModule`, `QueueModule`, `HealthModule`, `OrdersModule` e registra `APP_PIPE` (`ZodValidationPipe`) e `APP_INTERCEPTOR` (`ZodSerializerInterceptor`).
 - `src/main.ts` -> Único ponto de entrada. Deve apenas criar a aplicação Nest (`NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter())`), habilitar shutdown hooks e chamar `listen(env.PORT, "0.0.0.0")`. A fila é inicializada pelo ciclo de vida do `QueueModule`, antes do HTTP começar a escutar.
 
 ## ✍️ Padrão de Documentação e Estilo de Código (Crítico)

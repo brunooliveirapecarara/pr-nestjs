@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { Injectable, Module, type LoggerService } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { DiscoveryService, Reflector } from '@nestjs/core';
 import { Test, type TestingModule } from '@nestjs/testing';
 import type { ConsumeMessage } from 'amqplib';
+import { env } from '../config/env.js';
 import { Job, type JobHandler } from './job.decorator.js';
 import { JobPublisher } from './job-publisher.service.js';
 import { JobStore } from './job-store.service.js';
@@ -103,7 +105,17 @@ class OnceJob implements JobHandler<{ id: number }> {
   }
 }
 
-@Module({ imports: [QueueModule], providers: [FlakyJob, OnceJob] })
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      ignoreEnvFile: true,
+      load: [() => env],
+    }),
+    QueueModule,
+  ],
+  providers: [FlakyJob, OnceJob],
+})
 class TestModule {}
 
 /**
@@ -253,6 +265,7 @@ describe('QueueService', () => {
         moduleRef.get(DiscoveryService),
         moduleRef.get(Reflector),
         store as unknown as JobStore,
+        moduleRef.get(ConfigService),
       );
 
       expect(() => isolated.dispatch(FlakyJob, { id: 1 })).toThrow(
