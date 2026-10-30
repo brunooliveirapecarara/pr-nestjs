@@ -1,10 +1,5 @@
 import { setTimeout } from 'node:timers/promises';
-import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
-import type { MySql2Database } from 'drizzle-orm/mysql2';
-import { DRIZZLE } from '../database/database.constants.js';
-import * as schema from '../database/schema.js';
-import { ORDER_STATUS, type OrderStatus } from '../database/schema.js';
+import { Injectable, Logger } from '@nestjs/common';
 import { Job, type JobHandler } from '../queue/job.decorator.js';
 
 /**
@@ -18,11 +13,8 @@ export interface OrderMessage {
 }
 
 /**
- * Processa um pedido apenas registrando o ciclo de vida, sem efeitos externos reais.
- *
- * É idempotente: a entrega da fila é "pelo menos uma vez", então o job reivindica o pedido com uma
- * transição condicional (`pending -> processing`) e ignora a mensagem se outra execução já o reivindicou
- * ou concluiu.
+ * Processa um pedido apenas registrando o ciclo de vida, sem efeitos externos reais. A idempotência é
+ * garantida pelo `QueueService`, que reivindica o job na tabela `jobs` antes de chamar o `handle`.
  */
 @Injectable()
 @Job({
@@ -34,74 +26,17 @@ export interface OrderMessage {
 export class ProcessOrderJob implements JobHandler<OrderMessage> {
   private readonly logger = new Logger(ProcessOrderJob.name);
 
-  constructor(
-    @Inject(DRIZZLE) private readonly db: MySql2Database<typeof schema>,
-  ) {}
-
   /**
-   * Processa um pedido registrando o ciclo de vida do job. Se o processamento falhar, devolve o pedido a
-   * `pending` para que a retentativa possa reivindicá-lo de novo.
+   * Processa um pedido registrando o ciclo de vida do job.
    *
    * @param order - Dados do pedido a processar.
-   * @returns Promise resolvida quando o processamento terminar, ou imediatamente se o pedido já foi tratado.
-   * @throws Erro do driver ou do processamento; o pedido volta a `pending` antes de o erro propagar.
+   * @returns Promise resolvida quando o processamento terminar.
    */
   async handle(order: OrderMessage): Promise<void> {
-    const claimed = await this.transition(
-      order.orderId,
-      ORDER_STATUS.pending,
-      ORDER_STATUS.processing,
+    this.logger.log(
+      `⚙️ Processando pedido #${order.orderId} de ${order.customerEmail}`,
     );
-    if (!claimed) {
-      this.logger.warn(
-        `⏭️ Pedido #${order.orderId} não está pendente (já processado, em processamento ou inexistente); ignorando`,
-      );
-      return;
-    }
-
-    try {
-      this.logger.log(
-        `⚙️ Processando pedido #${order.orderId} de ${order.customerEmail}`,
-      );
-      await setTimeout(500);
-      await this.transition(
-        order.orderId,
-        ORDER_STATUS.processing,
-        ORDER_STATUS.processed,
-      );
-      this.logger.log(
-        `✅ Concluído pedido #${order.orderId} (${order.product})`,
-      );
-    } catch (error) {
-      await this.transition(
-        order.orderId,
-        ORDER_STATUS.processing,
-        ORDER_STATUS.pending,
-      );
-      throw error;
-    }
-  }
-
-  /**
-   * Muda o status de um pedido apenas se ele ainda estiver no status esperado.
-   *
-   * @param orderId - Id do pedido.
-   * @param from - Status que o pedido deve ter para a mudança ocorrer.
-   * @param to - Novo status.
-   * @returns `true` se esta chamada fez a transição; `false` se o pedido não estava em `from`.
-   * @throws Erro do driver se o update falhar.
-   */
-  private async transition(
-    orderId: number,
-    from: OrderStatus,
-    to: OrderStatus,
-  ): Promise<boolean> {
-    const [result] = await this.db
-      .update(schema.orders)
-      .set({ status: to })
-      .where(
-        and(eq(schema.orders.id, orderId), eq(schema.orders.status, from)),
-      );
-    return result.affectedRows > 0;
+    await setTimeout(500);
+    this.logger.log(`✅ Concluído pedido #${order.orderId} (${order.product})`);
   }
 }
