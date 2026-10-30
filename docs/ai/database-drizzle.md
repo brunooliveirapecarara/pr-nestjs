@@ -3,27 +3,54 @@
 ## Schema — `src/database/schema.ts`
 
 ```ts
-import { decimal, int, mysqlTable, timestamp, varchar } from 'drizzle-orm/mysql-core';
-
-export const ORDER_STATUS = {
-  pending: 'pending',
-  processing: 'processing',
-  processed: 'processed',
-} as const;
-
-export type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];
+import { decimal, index, int, json, mysqlTable, text, timestamp, varchar } from 'drizzle-orm/mysql-core';
 
 export const orders = mysqlTable('orders', {
   id: int('id').autoincrement().primaryKey(),
   customerEmail: varchar('customer_email', { length: 255 }).notNull(),
   product: varchar('product', { length: 255 }).notNull(),
   amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
-  status: varchar('status', { length: 20 }).$type<OrderStatus>().notNull().default(ORDER_STATUS.pending),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
+
+export const JOB_STATUS = {
+  pending: 'pending',
+  published: 'published',
+  processing: 'processing',
+  done: 'done',
+  failed: 'failed',
+} as const;
+
+export type JobStatus = (typeof JOB_STATUS)[keyof typeof JOB_STATUS];
+
+export const jobs = mysqlTable(
+  'jobs',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    queue: varchar('queue', { length: 100 }).notNull(),
+    name: varchar('name', { length: 100 }).notNull(),
+    payload: json('payload').$type<unknown>().notNull(),
+    status: varchar('status', { length: 20 }).$type<JobStatus>().notNull().default(JOB_STATUS.pending),
+    attempts: int('attempts').notNull().default(0),
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at', { fsp: 3 }).defaultNow().notNull(),
+    publishedAt: timestamp('published_at', { fsp: 3 }),
+    startedAt: timestamp('started_at', { fsp: 3 }),
+    finishedAt: timestamp('finished_at', { fsp: 3 }),
+  },
+  (table) => [index('jobs_status_created_at_idx').on(table.status, table.createdAt)],
+);
 ```
 
-As colunas `id`, `customer_email`, `product`, `amount` e `created_at` são idênticas às do projeto original (`bun-fastify/src/db/schema.ts`). `status` é um acréscimo deste projeto (migration `0001_add_status_to_orders`): é a trava de idempotência do job `process_order` (ver `queue-rabbitmq.md`). Linhas anteriores à migration ficam `pending`.
+A tabela `orders` é idêntica à do projeto original (`bun-fastify/src/db/schema.ts`). A tabela `jobs` é um acréscimo deste projeto (migration `0002_create_jobs_table`) e serve de **outbox** e de **registro do ciclo de vida** dos jobs (ver `queue-rabbitmq.md`):
+
+- `pending`: gravado na mesma transação do dado de negócio, ainda não publicado.
+- `published`: confirmado pelo broker (também é o estado de um job aguardando retry).
+- `processing`: reivindicado por um worker (`started_at` marca o início; passado o lease, outra entrega pode reassumi-lo).
+- `done` / `failed`: terminais. `failed` = foi para a DLQ e guarda `last_error`.
+- `attempts` conta as execuções iniciadas. O índice `(status, created_at)` serve à varredura do publicador.
+
+Histórico: a `0001` adicionou `orders.status` e a `0003` o removeu, quando a idempotência passou para a tabela `jobs`.
 
 ## Módulo — `src/database/database.module.ts`
 

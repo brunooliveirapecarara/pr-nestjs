@@ -89,7 +89,7 @@ import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { DRIZZLE } from '../database/database.constants.js';
 import * as schema from '../database/schema.js';
 import { ProcessOrderJob } from '../jobs/process-order.job.js';
-import { QueueService } from '../queue/queue.service.js';
+import { JobStore } from '../queue/job-store.service.js';
 import type { CreateOrderDto, OrderResponseDto } from './order.schema.js';
 
 /**
@@ -99,36 +99,45 @@ import type { CreateOrderDto, OrderResponseDto } from './order.schema.js';
 export class OrdersService {
   constructor(
     @Inject(DRIZZLE) private readonly db: MySql2Database<typeof schema>,
-    private readonly queue: QueueService,
+    private readonly jobs: JobStore,
   ) {}
 
   /**
-   * Persiste o pedido e despacha o job `process_order`.
+   * Persiste o pedido e grava o job `process_order` na mesma transação (outbox).
    *
    * @param input - Dados validados do pedido.
    * @returns Pedido criado com o `id` gerado.
-   * @throws Erro do driver se o insert falhar.
+   * @throws Erro do driver se algum insert falhar (a transação é desfeita).
    */
   async create(input: CreateOrderDto): Promise<OrderResponseDto> {
-    const [result] = await this.db.insert(schema.orders).values({
-      customerEmail: input.customer_email,
-      product: input.product,
-      amount: input.amount.toFixed(2),
+    const orderId = await this.db.transaction(async (tx) => {
+      const [result] = await tx.insert(schema.orders).values({
+        customerEmail: input.customer_email,
+        product: input.product,
+        amount: input.amount.toFixed(2),
+      });
+
+      await this.jobs.enqueue(tx, ProcessOrderJob, {
+        orderId: result.insertId,
+        customerEmail: input.customer_email,
+        product: input.product,
+        amount: input.amount,
+      });
+
+      return result.insertId;
     });
 
-    this.queue.dispatch(ProcessOrderJob, {
-      orderId: result.insertId,
-      customerEmail: input.customer_email,
+    return {
+      id: orderId,
+      customer_email: input.customer_email,
       product: input.product,
       amount: input.amount,
-    });
-
-    return { id: result.insertId, ...input };
+    };
   }
 }
 ```
 
-Note: `import type` é permitido para `MySql2Database` e DTOs usados só como tipo em parâmetros **não injetados**; `QueueService` é injetado e portanto usa import normal.
+Note: `import type` é permitido para `MySql2Database` e DTOs usados só como tipo em parâmetros **não injetados**; `JobStore` é injetado e portanto usa import normal.
 
 ## Provider customizado (token)
 

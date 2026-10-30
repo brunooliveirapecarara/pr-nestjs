@@ -18,8 +18,9 @@
 
 1. `src/jobs/<nome>.job.ts` com classe `@Injectable() @Job({ queue, name })` implementando `JobHandler<Payload>`.
 2. Registre a classe em `providers` de um módulo.
-3. Dispare com `this.queue.dispatch(NomeJob, payload)`.
+3. Dispare gravando o job na mesma transação do dado de negócio: `await this.jobs.enqueue(tx, NomeJob, payload)` (`JobStore`, outbox). O `JobPublisher` o publica depois. `queue.dispatch(NomeJob, payload)` existe, mas publica direto, sem registro nem idempotência (use só para mensagens descartáveis).
 4. Logs: 📥 (feito pelo `QueueService`), ⚙️ e ✅ no `handle`.
+5. O `handle` pode assumir que roda uma vez por job (o `QueueService` reivindica o job na tabela `jobs`), mas efeitos externos ainda precisam de chave de idempotência no provedor.
 
 ## Criar uma migration
 
