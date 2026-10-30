@@ -46,7 +46,12 @@ export const Job = DiscoveryService.createDecorator<JobOptions>();
 
 ```ts
 import { setTimeout } from 'node:timers/promises';
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { and, eq } from 'drizzle-orm';
+import type { MySql2Database } from 'drizzle-orm/mysql2';
+import { DRIZZLE } from '../database/database.constants.js';
+import * as schema from '../database/schema.js';
+import { ORDER_STATUS, type OrderStatus } from '../database/schema.js';
 import { Job, type JobHandler } from '../queue/job.decorator.js';
 
 /**
@@ -61,25 +66,69 @@ export interface OrderMessage {
 
 /**
  * Processa um pedido apenas registrando o ciclo de vida, sem efeitos externos reais.
+ * Idempotente: reivindica o pedido com `pending -> processing` e ignora duplicatas.
  */
 @Injectable()
 @Job({ queue: 'order_processing', name: 'process_order', retries: 3, backoffMs: 5000 })
 export class ProcessOrderJob implements JobHandler<OrderMessage> {
   private readonly logger = new Logger(ProcessOrderJob.name);
 
+  constructor(@Inject(DRIZZLE) private readonly db: MySql2Database<typeof schema>) {}
+
   /**
-   * Processa um pedido registrando o ciclo de vida do job.
+   * Processa um pedido registrando o ciclo de vida do job. Se falhar, devolve o pedido a `pending`.
    *
    * @param order - Dados do pedido a processar.
-   * @returns Promise resolvida quando o processamento terminar.
+   * @returns Promise resolvida quando o processamento terminar, ou ao ignorar uma duplicata.
+   * @throws Erro do driver ou do processamento (o pedido volta a `pending` antes de propagar).
    */
   async handle(order: OrderMessage): Promise<void> {
-    this.logger.log(`⚙️ Processando pedido #${order.orderId} de ${order.customerEmail}`);
-    await setTimeout(500);
-    this.logger.log(`✅ Concluído pedido #${order.orderId} (${order.product})`);
+    if (!(await this.transition(order.orderId, ORDER_STATUS.pending, ORDER_STATUS.processing))) {
+      this.logger.warn(`⏭️ Pedido #${order.orderId} não está pendente; ignorando`);
+      return;
+    }
+
+    try {
+      this.logger.log(`⚙️ Processando pedido #${order.orderId} de ${order.customerEmail}`);
+      await setTimeout(500);
+      await this.transition(order.orderId, ORDER_STATUS.processing, ORDER_STATUS.processed);
+      this.logger.log(`✅ Concluído pedido #${order.orderId} (${order.product})`);
+    } catch (error) {
+      await this.transition(order.orderId, ORDER_STATUS.processing, ORDER_STATUS.pending);
+      throw error;
+    }
+  }
+
+  /**
+   * Muda o status do pedido só se ele ainda estiver em `from`.
+   *
+   * @param orderId - Id do pedido.
+   * @param from - Status esperado.
+   * @param to - Novo status.
+   * @returns `true` se esta chamada fez a transição.
+   * @throws Erro do driver se o update falhar.
+   */
+  private async transition(orderId: number, from: OrderStatus, to: OrderStatus): Promise<boolean> {
+    const [result] = await this.db
+      .update(schema.orders)
+      .set({ status: to })
+      .where(and(eq(schema.orders.id, orderId), eq(schema.orders.status, from)));
+    return result.affectedRows > 0;
   }
 }
 ```
+
+### Idempotência dos jobs
+
+A entrega é "pelo menos uma vez": a mesma mensagem pode chegar mais de uma vez (reentrega após queda do broker, falha entre o reenvio do retry e o `ack`, `dispatch` repetido ou duas réplicas/`concorrência > 1`). Todo job com efeito real deve tolerar isso.
+
+- **Técnica adotada (estado + update condicional):** o job reivindica o recurso com `UPDATE ... SET status = 'processing' WHERE id = ? AND status = 'pending'` e só prossegue se `affectedRows > 0`. A atomicidade do banco garante que, entre cópias simultâneas, só uma execução reivindique.
+- Fluxo de estados de `orders.status`: `pending` -> `processing` -> `processed`. Se o processamento falhar, o job devolve a `pending` e relança o erro, para a retentativa poder reivindicar de novo.
+- Duplicata é ignorada com `warn` (`⏭️`) e a mensagem recebe `ack`: não é falha, então não vai a retry nem à DLQ.
+- **Limitação:** se o processo morrer entre a reivindicação e a conclusão, o pedido fica em `processing` e as reentregas são ignoradas. Um job real que precise se recuperar disso deve gravar um instante de reivindicação e permitir reassumir pedidos `processing` antigos.
+- Efeitos externos (e-mail, pagamento) não entram na transação do banco: envie uma chave de idempotência ao provedor. Para jobs sem chave natural, use uma tabela de deduplicação com `UNIQUE(job, chave)` inserida na mesma transação do efeito.
+- Não use `Set` em memória nem "verificar e depois agir" sem constraint ou update condicional.
+- Lado do produtor: o `POST /orders` grava o pedido e depois chama `dispatch`; se o `dispatch` falhar (500), o pedido fica sem job. Corrigir isso exige outbox e não faz parte desta técnica.
 
 O job só é registrado se a classe estiver em `providers` de algum módulo.
 

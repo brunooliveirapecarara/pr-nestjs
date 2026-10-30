@@ -5,16 +5,25 @@
 ```ts
 import { decimal, int, mysqlTable, timestamp, varchar } from 'drizzle-orm/mysql-core';
 
+export const ORDER_STATUS = {
+  pending: 'pending',
+  processing: 'processing',
+  processed: 'processed',
+} as const;
+
+export type OrderStatus = (typeof ORDER_STATUS)[keyof typeof ORDER_STATUS];
+
 export const orders = mysqlTable('orders', {
   id: int('id').autoincrement().primaryKey(),
   customerEmail: varchar('customer_email', { length: 255 }).notNull(),
   product: varchar('product', { length: 255 }).notNull(),
   amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+  status: varchar('status', { length: 20 }).$type<OrderStatus>().notNull().default(ORDER_STATUS.pending),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 ```
 
-Mantenha as colunas idênticas às do projeto original (`bun-fastify/src/db/schema.ts`); confira antes de portar.
+As colunas `id`, `customer_email`, `product`, `amount` e `created_at` são idênticas às do projeto original (`bun-fastify/src/db/schema.ts`). `status` é um acréscimo deste projeto (migration `0001_add_status_to_orders`): é a trava de idempotência do job `process_order` (ver `queue-rabbitmq.md`). Linhas anteriores à migration ficam `pending`.
 
 ## Módulo — `src/database/database.module.ts`
 

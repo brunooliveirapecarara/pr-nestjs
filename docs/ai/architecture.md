@@ -53,10 +53,10 @@ AppModule
 
 1. `OrdersController.create` recebe `@Body() CreateOrderDto`; o `ZodValidationPipe` global valida (400 se inválido).
 2. Delegação para `OrdersService.create(input)`.
-3. O service insere em `orders` via Drizzle (`amount.toFixed(2)`), obtém `insertId`.
+3. O service insere em `orders` via Drizzle (`amount.toFixed(2)`; `status` nasce `pending`), obtém `insertId`.
 4. O service chama `queueService.dispatch(ProcessOrderJob, payload)` (fila `order_processing`, `type: process_order`).
 5. O controller retorna o objeto com status 201; o `ZodSerializerInterceptor` valida a saída com `orderResponseSchema`.
-6. O worker consome: 📥 Recebido -> ⚙️ Processando -> ✅ Concluído; `ack` em sucesso; em falha, retry atrasado (`🔁`) até `retries` e depois DLQ `order_processing.dlq` (`💀`).
+6. O worker consome: 📥 Recebido -> ⚙️ Processando -> ✅ Concluído. O job reivindica o pedido (`pending -> processing -> processed`, update condicional) e ignora duplicatas com `⏭️`; `ack` em sucesso; em falha, retry atrasado (`🔁`) até `retries` e depois DLQ `order_processing.dlq` (`💀`).
 
 ## Ciclo de vida da aplicação
 
